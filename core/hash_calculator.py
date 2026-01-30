@@ -4,7 +4,10 @@ import os
 import logging
 from typing import List, Dict, Any, Optional, Callable
 from PIL import Image
+from pillow_heif import register_heif_opener
 import imagehash
+
+register_heif_opener()
 from config import DEFAULT_HASH_SIZE
 
 logger = logging.getLogger(__name__)

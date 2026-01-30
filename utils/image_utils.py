@@ -6,6 +6,9 @@ import logging
 from pathlib import Path
 from typing import Tuple, Dict, Any
 from PIL import Image
+from pillow_heif import register_heif_opener
+
+register_heif_opener()
 from PyQt6.QtGui import QPixmap
 from config import THUMBNAIL_SIZE, THUMBNAIL_CACHE_DIR
 

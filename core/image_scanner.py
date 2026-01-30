@@ -4,6 +4,9 @@ import os
 import logging
 from typing import List, Callable, Optional
 from PIL import Image
+from pillow_heif import register_heif_opener
+
+register_heif_opener()
 from config import SUPPORTED_EXTENSIONS, MAX_IMAGE_SIZE
 
 logger = logging.getLogger(__name__)

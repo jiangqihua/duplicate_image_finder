@@ -1,7 +1,7 @@
 """Configuration constants for Duplicate Image Finder."""
 
 # Image scanning
-SUPPORTED_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.bmp', '.gif', '.webp', '.tiff'}
+SUPPORTED_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.bmp', '.gif', '.webp', '.tiff', '.heic', '.heif'}
 MAX_IMAGE_SIZE = 50 * 1024 * 1024  # 50 MB
 
 # Hashing

@@ -191,12 +191,19 @@ class MainWindow(QMainWindow):
         self.scan_worker.finished.connect(self.on_scan_complete)
         self.scan_worker.error.connect(self.on_scan_error)
 
-        self.progress_dialog.rejected.connect(lambda: self.scan_worker.cancel())
+        self.progress_dialog.rejected.connect(self._on_scan_cancelled)
 
         self.scan_worker.start()
         self.progress_dialog.exec()
 
         logger.info(f"Started scanning folder: {folder_path}")
+
+    def _on_scan_cancelled(self):
+        """Handle scan cancellation by the user."""
+        self.scan_worker.cancel()
+        self.scan_button.setEnabled(True)
+        self.status_label.setText("Scan cancelled.")
+        logger.info("Scan cancelled by user")
 
     def on_scan_complete(self, image_hashes: List[Dict[str, Any]]):
         """
