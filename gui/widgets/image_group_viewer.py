@@ -1,5 +1,7 @@
 """Image group viewer widget for displaying groups of similar images."""
 
+import subprocess
+import sys
 from typing import List, Dict, Any
 from PyQt6.QtWidgets import (QScrollArea, QWidget, QVBoxLayout, QHBoxLayout,
                              QGroupBox, QPushButton, QLabel)
@@ -120,9 +122,14 @@ class ImageGroupViewer(QScrollArea):
         keep_best_btn.clicked.connect(lambda: self._keep_best_in_group(group_index))
         keep_best_btn.setToolTip("Keep highest resolution image, select others for deletion")
 
+        open_all_btn = QPushButton("Open All")
+        open_all_btn.clicked.connect(lambda: self._open_all_in_group(group_index))
+        open_all_btn.setToolTip("Open all images in this group with the system viewer")
+
         controls_layout.addWidget(select_all_btn)
         controls_layout.addWidget(deselect_all_btn)
         controls_layout.addWidget(keep_best_btn)
+        controls_layout.addWidget(open_all_btn)
         controls_layout.addStretch()
 
         group_layout.addLayout(controls_layout)
@@ -175,6 +182,26 @@ class ImageGroupViewer(QScrollArea):
         for i in range(start_index, start_index + group_size):
             if i < len(self.image_cards):
                 self.image_cards[i].set_selected(select)
+
+    def _open_all_in_group(self, group_index: int):
+        """
+        Open all images in a group with the system default viewer.
+
+        Args:
+            group_index: Index of the group
+        """
+        if group_index >= len(self.groups):
+            return
+
+        paths = [img['path'] for img in self.groups[group_index]]
+        if sys.platform == 'darwin':
+            subprocess.Popen(['open'] + paths)
+        elif sys.platform == 'win32':
+            for path in paths:
+                subprocess.Popen(['start', '', path], shell=True)
+        else:
+            for path in paths:
+                subprocess.Popen(['xdg-open', path])
 
     def _keep_best_in_group(self, group_index: int):
         """
