@@ -24,6 +24,7 @@ class ProgressDialog(QDialog):
         self.progress_bar = None
         self.message_label = None
         self.cancelled = False
+        self.cancelable = True
 
         self.init_ui()
 
@@ -60,8 +61,8 @@ class ProgressDialog(QDialog):
         """
         if total > 0:
             percentage = int((current / total) * 100)
-            self.progress_bar.setValue(percentage)
             self.progress_bar.setMaximum(100)
+            self.progress_bar.setValue(percentage)
 
             if message:
                 self.message_label.setText(f"{message} ({current}/{total})")
@@ -80,14 +81,38 @@ class ProgressDialog(QDialog):
         Args:
             cancelable: Whether the operation can be cancelled
         """
+        self.cancelable = cancelable
         self.cancel_button.setEnabled(cancelable)
+
+    def start_stage(self, title: str):
+        """
+        Reuse the dialog for the next stage of the operation.
+
+        Args:
+            title: New dialog title
+        """
+        self.setWindowTitle(title)
+        self.message_label.setText("Initializing...")
+        self.progress_bar.setMaximum(100)
+        self.progress_bar.setValue(0)
+
+    def finish(self):
+        """Close the dialog because the operation ended. This is not a cancel."""
+        if self.isVisible():
+            self.accept()
 
     def _on_cancel(self):
         """Handle cancel button click."""
-        self.cancelled = True
         self.message_label.setText("Cancelling...")
         self.cancel_button.setEnabled(False)
         self.reject()
+
+    def reject(self):
+        """Handle every user cancel: the button, Esc and closing the window."""
+        if not self.cancelable:
+            return
+        self.cancelled = True
+        super().reject()
 
     def is_cancelled(self) -> bool:
         """
@@ -97,9 +122,3 @@ class ProgressDialog(QDialog):
             True if cancelled, False otherwise
         """
         return self.cancelled
-
-    def closeEvent(self, event):
-        """Handle dialog close event."""
-        if not self.cancelled:
-            self._on_cancel()
-        event.accept()

@@ -4,12 +4,13 @@ import os
 import hashlib
 import logging
 from pathlib import Path
-from typing import Tuple, Dict, Any
+import threading
+from typing import Tuple, Dict, Any, Optional
 from PIL import Image
 from pillow_heif import register_heif_opener
 
 register_heif_opener()
-from PyQt6.QtGui import QPixmap
+from PyQt6.QtGui import QImage, QPixmap
 from config import THUMBNAIL_SIZE, THUMBNAIL_CACHE_DIR
 
 logger = logging.getLogger(__name__)
@@ -24,69 +25,87 @@ class ImageUtils:
         self.cache_dir.mkdir(exist_ok=True)
         self.memory_cache = {}
 
-    def create_thumbnail(self, image_path: str, size: Tuple[int, int] = THUMBNAIL_SIZE) -> QPixmap:
+    def get_cached_pixmap(self, image_path: str, size: Tuple[int, int] = THUMBNAIL_SIZE) -> Optional[QPixmap]:
         """
-        Create thumbnail with caching.
+        Get a thumbnail from the memory cache. Main thread only.
 
         Args:
             image_path: Path to the image
             size: Thumbnail size (width, height)
 
         Returns:
-            QPixmap thumbnail
+            QPixmap thumbnail, or None if it is not in memory yet
         """
-        # Check memory cache
-        cache_key = f"{image_path}_{size[0]}x{size[1]}"
-        if cache_key in self.memory_cache:
-            return self.memory_cache[cache_key]
+        return self.memory_cache.get(f"{image_path}_{size[0]}x{size[1]}")
 
-        # Check disk cache
+    def cache_pixmap(self, image_path: str, pixmap: QPixmap, size: Tuple[int, int] = THUMBNAIL_SIZE):
+        """
+        Store a thumbnail in the memory cache. Main thread only.
+
+        Args:
+            image_path: Path to the image
+            pixmap: Thumbnail
+            size: Thumbnail size (width, height)
+        """
+        self.memory_cache[f"{image_path}_{size[0]}x{size[1]}"] = pixmap
+
+    def load_thumbnail_image(self, image_path: str, size: Tuple[int, int] = THUMBNAIL_SIZE) -> QImage:
+        """
+        Load a thumbnail from the disk cache, generating it if needed.
+
+        Safe to call from worker threads: it returns a QImage because QPixmap
+        may only be used on the main thread.
+
+        Args:
+            image_path: Path to the image
+            size: Thumbnail size (width, height)
+
+        Returns:
+            QImage thumbnail, null if the image could not be read
+        """
         cache_file = self._get_cache_path(image_path, size)
         if cache_file.exists():
-            pixmap = QPixmap(str(cache_file))
-            if not pixmap.isNull():
-                self.memory_cache[cache_key] = pixmap
-                return pixmap
+            image = QImage(str(cache_file))
+            if not image.isNull():
+                return image
 
-        # Generate thumbnail
         try:
-            pixmap = self._generate_thumbnail(image_path, size, cache_file)
-            self.memory_cache[cache_key] = pixmap
-            return pixmap
+            self._generate_thumbnail(image_path, size, cache_file)
+            return QImage(str(cache_file))
         except Exception as e:
             logger.error(f"Error creating thumbnail for {image_path}: {e}")
-            # Return empty pixmap
-            return QPixmap()
+            return QImage()
 
-    def _generate_thumbnail(self, image_path: str, size: Tuple[int, int], cache_file: Path) -> QPixmap:
+    def _generate_thumbnail(self, image_path: str, size: Tuple[int, int], cache_file: Path):
         """
-        Generate thumbnail and save to cache.
+        Generate thumbnail and save it to the disk cache.
+
+        The file is written under a temporary name and moved into place, so
+        another thread never reads a partial thumbnail.
 
         Args:
             image_path: Path to the image
             size: Thumbnail size
             cache_file: Path to cache file
-
-        Returns:
-            QPixmap thumbnail
         """
-        with Image.open(image_path) as img:
-            # Use draft mode for faster loading
-            img.draft('RGB', size)
+        temp_file = cache_file.with_name(f"{cache_file.stem}.{threading.get_ident()}.tmp")
+        try:
+            with Image.open(image_path) as img:
+                # Use draft mode for faster loading
+                img.draft('RGB', size)
 
-            # Convert to RGB if needed
-            if img.mode not in ('RGB', 'L'):
-                img = img.convert('RGB')
+                # Convert to RGB if needed
+                if img.mode not in ('RGB', 'L'):
+                    img = img.convert('RGB')
 
-            # Create thumbnail maintaining aspect ratio
-            img.thumbnail(size, Image.Resampling.LANCZOS)
+                # Create thumbnail maintaining aspect ratio
+                img.thumbnail(size, Image.Resampling.LANCZOS)
 
-            # Save to cache
-            img.save(cache_file, 'JPEG', quality=85)
+                img.save(temp_file, 'JPEG', quality=85)
 
-        # Load as QPixmap
-        pixmap = QPixmap(str(cache_file))
-        return pixmap
+            os.replace(temp_file, cache_file)
+        finally:
+            temp_file.unlink(missing_ok=True)
 
     def _get_cache_path(self, image_path: str, size: Tuple[int, int]) -> Path:
         """

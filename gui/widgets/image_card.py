@@ -8,8 +8,6 @@ from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtGui import QPixmap
 from utils.image_utils import ImageUtils
 
-image_utils = ImageUtils()
-
 
 class ImageCard(QWidget):
     """Card displaying single image with metadata and selection checkbox."""
@@ -47,8 +45,8 @@ class ImageCard(QWidget):
         self.thumbnail_label.setMaximumSize(200, 200)
         self.thumbnail_label.setStyleSheet("border: 1px solid #ccc; background-color: #f5f5f5;")
 
-        # Load thumbnail (lazy loading)
-        self.load_thumbnail()
+        # Filled in by set_thumbnail() once the background load finishes
+        self.thumbnail_label.setText("Loading...")
 
         # File name
         filename = os.path.basename(self.image_data['path'])
@@ -59,12 +57,12 @@ class ImageCard(QWidget):
         name_label.setStyleSheet("font-weight: bold;")
 
         # File size
-        file_size_str = image_utils.format_file_size(self.image_data['file_size'])
+        file_size_str = ImageUtils.format_file_size(self.image_data['file_size'])
         size_label = QLabel(f"Size: {file_size_str}")
         size_label.setStyleSheet("color: #666;")
 
         # Dimensions
-        dimensions_str = image_utils.format_dimensions(self.image_data['dimensions'])
+        dimensions_str = ImageUtils.format_dimensions(self.image_data['dimensions'])
         dim_label = QLabel(f"Dimensions: {dimensions_str}")
         dim_label.setStyleSheet("color: #666;")
 
@@ -89,35 +87,24 @@ class ImageCard(QWidget):
 
         # Set fixed width for the card
         self.setFixedWidth(220)
-        self.setStyleSheet("""
-            ImageCard {
-                border: 1px solid #ddd;
-                border-radius: 5px;
-                background-color: white;
-                padding: 5px;
-            }
-            ImageCard:hover {
-                border: 1px solid #999;
-            }
-        """)
 
-    def load_thumbnail(self):
-        """Load and display thumbnail."""
-        try:
-            pixmap = image_utils.create_thumbnail(self.image_data['path'])
+    def set_thumbnail(self, pixmap: QPixmap):
+        """
+        Display a thumbnail.
 
-            if not pixmap.isNull():
-                # Scale pixmap to fit label while maintaining aspect ratio
-                scaled_pixmap = pixmap.scaled(
-                    200, 200,
-                    Qt.AspectRatioMode.KeepAspectRatio,
-                    Qt.TransformationMode.SmoothTransformation
-                )
-                self.thumbnail_label.setPixmap(scaled_pixmap)
-            else:
-                self.thumbnail_label.setText("Failed to load\nthumbnail")
-        except Exception as e:
-            self.thumbnail_label.setText("Error loading\nthumbnail")
+        Args:
+            pixmap: Thumbnail, null if it could not be loaded
+        """
+        if pixmap.isNull():
+            self.thumbnail_label.setText("Failed to load\nthumbnail")
+            return
+
+        # Scale pixmap to fit label while maintaining aspect ratio
+        self.thumbnail_label.setPixmap(pixmap.scaled(
+            200, 200,
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation
+        ))
 
     def _on_selection_changed(self, state):
         """Handle selection checkbox state change."""

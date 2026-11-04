@@ -1,20 +1,19 @@
 """Main window for Duplicate Image Finder application."""
 
 import logging
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 from PyQt6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
                              QPushButton, QLabel, QLineEdit, QSlider, QFileDialog,
                              QMessageBox)
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, QThread, QTimer
 from core.image_scanner import ImageScanner
 from core.hash_calculator import HashCalculator
-from core.similarity_detector import SimilarityDetector
 from core.file_manager import FileManager
 from gui.widgets.image_group_viewer import ImageGroupViewer
 from gui.widgets.progress_dialog import ProgressDialog
-from utils.threading_utils import ScanWorker, DeleteWorker
+from utils.threading_utils import ScanWorker, GroupWorker, DeleteWorker
 from utils.image_utils import ImageUtils
-from config import WINDOW_SIZE, DEFAULT_THRESHOLD, MIN_THRESHOLD, MAX_THRESHOLD
+from config import WINDOW_SIZE, DEFAULT_THRESHOLD, MIN_THRESHOLD, MAX_THRESHOLD, REGROUP_DELAY_MS
 
 logger = logging.getLogger(__name__)
 image_utils = ImageUtils()
@@ -30,7 +29,6 @@ class MainWindow(QMainWindow):
         # Core components
         self.scanner = ImageScanner()
         self.hash_calculator = HashCalculator()
-        self.similarity_detector = SimilarityDetector()
         self.file_manager = FileManager()
 
         # Data
@@ -40,8 +38,21 @@ class MainWindow(QMainWindow):
 
         # Worker threads
         self.scan_worker = None
+        self.group_worker = None
         self.delete_worker = None
         self.progress_dialog = None
+
+        # Operation state, see _update_controls()
+        self.scanning = False
+        self.deleting = False
+        self.grouping_active = False
+        self.pending_threshold = None  # Threshold to group with after the current run
+
+        # Waits for the threshold slider to settle
+        self.regroup_timer = QTimer(self)
+        self.regroup_timer.setSingleShot(True)
+        self.regroup_timer.setInterval(REGROUP_DELAY_MS)
+        self.regroup_timer.timeout.connect(self._regroup)
 
         # UI components
         self.folder_input = None
@@ -171,19 +182,22 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "No Folder Selected", "Please select a folder to scan.")
             return
 
+        # Stop whatever is still running from earlier results
+        self.regroup_timer.stop()
+        self._cancel_grouping()
+        self._wait_for_worker(self.scan_worker)
+
         # Clear previous results
         self.image_hashes = []
         self.groups = []
         self.image_viewer.clear()
 
-        # Disable controls
-        self.scan_button.setEnabled(False)
-        self.delete_button.setEnabled(False)
-        self.clear_button.setEnabled(False)
-        self.threshold_slider.setEnabled(False)
+        self.scanning = True
+        self._update_controls()
 
         # Create progress dialog
         self.progress_dialog = ProgressDialog("Scanning Images", self)
+        self.progress_dialog.rejected.connect(self._on_scan_cancelled)
 
         # Create and start worker thread
         self.scan_worker = ScanWorker(self.scanner, self.hash_calculator, folder_path)
@@ -191,84 +205,49 @@ class MainWindow(QMainWindow):
         self.scan_worker.finished.connect(self.on_scan_complete)
         self.scan_worker.error.connect(self.on_scan_error)
 
-        self.progress_dialog.rejected.connect(self._on_scan_cancelled)
-
-        self.scan_worker.start()
-        self.progress_dialog.exec()
-
         logger.info(f"Started scanning folder: {folder_path}")
 
+        self.scan_worker.start()
+        self.progress_dialog.show()
+
     def _on_scan_cancelled(self):
-        """Handle scan cancellation by the user."""
+        """Handle the user cancelling a scan, during hashing or comparing."""
         self.scan_worker.cancel()
-        self.scan_button.setEnabled(True)
+        self._cancel_grouping()
+        self._close_progress_dialog()
+
+        self.image_hashes = []
+        self.groups = []
+        self.scanning = False
+        self._update_controls()
+
         self.status_label.setText("Scan cancelled.")
         logger.info("Scan cancelled by user")
 
     def on_scan_complete(self, image_hashes: List[Dict[str, Any]]):
         """
-        Handle scan completion.
+        Handle scan completion by starting the comparison stage.
 
         Args:
             image_hashes: List of image hash dictionaries
         """
-        self.progress_dialog.close()
+        if self.scan_worker.cancelled:
+            return
 
         self.image_hashes = image_hashes
 
         if not image_hashes:
+            self._close_progress_dialog()
+            self.scanning = False
+            self._update_controls()
             self.status_label.setText("No images found in the selected folder.")
-            self.scan_button.setEnabled(True)
             return
 
         logger.info(f"Scan complete: {len(image_hashes)} images processed")
 
-        # Update status
         self.status_label.setText(f"Processing {len(image_hashes)} images, finding duplicates...")
-
-        # Create progress dialog for similarity comparison
-        comparison_progress = ProgressDialog("Finding Duplicates", self)
-        comparison_progress.set_cancelable(False)
-        comparison_progress.show()
-
-        # Process events to show the dialog
-        from PyQt6.QtWidgets import QApplication
-        QApplication.processEvents()
-
-        # Find similar groups with progress callback
-        threshold = self.threshold_slider.value()
-        self.similarity_detector.threshold = threshold
-        self.groups = self.similarity_detector.find_similar_groups(
-            image_hashes,
-            progress_callback=lambda curr, total, msg: self._update_comparison_progress(
-                comparison_progress, curr, total, msg
-            )
-        )
-
-        # Close progress dialog
-        comparison_progress.close()
-
-        # Display results
-        self.image_viewer.set_groups(self.groups)
-
-        # Update status
-        stats = self.image_viewer.get_stats()
-        if stats['total_groups'] > 0:
-            self.status_label.setText(
-                f"Found {stats['total_groups']} groups with {stats['total_images']} duplicate images"
-            )
-            self.delete_button.setEnabled(True)
-            self.clear_button.setEnabled(True)
-            self.keep_best_all_button.setEnabled(True)
-        else:
-            self.status_label.setText(f"No duplicates found among {len(image_hashes)} images")
-            self.keep_best_all_button.setEnabled(False)
-
-        # Re-enable controls
-        self.scan_button.setEnabled(True)
-        self.threshold_slider.setEnabled(True)
-
-        logger.info(f"Found {stats['total_groups']} groups with {stats['total_images']} images")
+        self.progress_dialog.start_stage("Finding Duplicates")
+        self._start_grouping(self.threshold_slider.value())
 
     def on_scan_error(self, error_message: str):
         """
@@ -277,14 +256,17 @@ class MainWindow(QMainWindow):
         Args:
             error_message: Error message
         """
-        self.progress_dialog.close()
+        if self.scan_worker.cancelled:
+            return
 
-        QMessageBox.critical(self, "Scan Error", f"An error occurred during scanning:\n\n{error_message}")
+        self._close_progress_dialog()
+        self.scanning = False
+        self._update_controls()
 
         self.status_label.setText("Scan failed. Please try again.")
-        self.scan_button.setEnabled(True)
-
         logger.error(f"Scan error: {error_message}")
+
+        QMessageBox.critical(self, "Scan Error", f"An error occurred during scanning:\n\n{error_message}")
 
     def on_threshold_changed(self, value: int):
         """
@@ -295,45 +277,117 @@ class MainWindow(QMainWindow):
         """
         self.threshold_label.setText(str(value))
 
-        # If we have image hashes, recompute groups
         if self.image_hashes:
-            self.similarity_detector.threshold = value
+            self.regroup_timer.start()
+            self._update_controls()
 
-            # Show progress dialog for large image sets
-            if len(self.image_hashes) > 100:
-                comparison_progress = ProgressDialog("Recomputing Groups", self)
-                comparison_progress.set_cancelable(False)
-                comparison_progress.show()
+    def _regroup(self):
+        """Regroup the existing hashes with the slider's threshold."""
+        if not self.image_hashes:
+            return
 
-                from PyQt6.QtWidgets import QApplication
-                QApplication.processEvents()
+        self.status_label.setText("Finding duplicates with the new threshold...")
+        self._start_grouping(self.threshold_slider.value())
+        self._update_controls()
 
-                self.groups = self.similarity_detector.update_threshold(
-                    value,
-                    progress_callback=lambda curr, total, msg: self._update_comparison_progress(
-                        comparison_progress, curr, total, msg
-                    )
-                )
+    def _start_grouping(self, threshold: int):
+        """
+        Group the current hashes, replacing any grouping that is still running.
 
-                comparison_progress.close()
-            else:
-                # Small dataset, no need for progress dialog
-                self.groups = self.similarity_detector.update_threshold(value)
+        Args:
+            threshold: Maximum weighted hash distance for similarity
+        """
+        if self.grouping_active:
+            # on_grouping_complete() starts the new run when the old one stops
+            self.pending_threshold = threshold
+            self.group_worker.cancel()
+            return
 
-            self.image_viewer.set_groups(self.groups)
+        self.pending_threshold = None
+        self.grouping_active = True
 
-            # Update status
-            stats = self.image_viewer.get_stats()
-            if stats['total_groups'] > 0:
-                self.status_label.setText(
-                    f"Found {stats['total_groups']} groups with {stats['total_images']} duplicate images"
-                )
-                self.delete_button.setEnabled(True)
-                self.keep_best_all_button.setEnabled(True)
-            else:
-                self.status_label.setText(f"No duplicates found with current threshold")
-                self.delete_button.setEnabled(False)
-                self.keep_best_all_button.setEnabled(False)
+        self._wait_for_worker(self.group_worker)
+        self.group_worker = GroupWorker(self.image_hashes, threshold)
+        self.group_worker.progress.connect(self._on_grouping_progress)
+        self.group_worker.finished.connect(self.on_grouping_complete)
+        self.group_worker.error.connect(self.on_grouping_error)
+        self.group_worker.start()
+
+    def _cancel_grouping(self):
+        """Stop any running grouping and discard its result."""
+        self.pending_threshold = None
+        if self.grouping_active:
+            self.group_worker.cancel()
+
+    def _on_grouping_progress(self, percent: int, total: int, message: str):
+        """
+        Show grouping progress.
+
+        Args:
+            percent: Percentage done
+            total: Always 100
+            message: Progress message
+        """
+        if self.progress_dialog:
+            self.progress_dialog.update_progress(percent, total, message)
+        elif not self.group_worker.cancelled:
+            self.status_label.setText(f"{message}... {percent}%")
+
+    def on_grouping_complete(self, groups: Optional[List[List[Dict[str, Any]]]]):
+        """
+        Handle the end of a grouping run.
+
+        Args:
+            groups: The groups, or None if the run was cancelled
+        """
+        self.grouping_active = False
+
+        if self.pending_threshold is not None:
+            self._start_grouping(self.pending_threshold)
+            return
+
+        if groups is None or self.group_worker.cancelled:
+            self._update_controls()
+            return
+
+        was_scanning = self.scanning
+        self.scanning = False
+        self._close_progress_dialog()
+
+        self.groups = groups
+        self.image_viewer.set_groups(groups)
+        self._update_controls()
+
+        # Update status
+        stats = self.image_viewer.get_stats()
+        if stats['total_groups'] > 0:
+            self.status_label.setText(
+                f"Found {stats['total_groups']} groups with {stats['total_images']} duplicate images"
+            )
+        elif was_scanning:
+            self.status_label.setText(f"No duplicates found among {len(self.image_hashes)} images")
+        else:
+            self.status_label.setText("No duplicates found with current threshold")
+
+        logger.info(f"Found {stats['total_groups']} groups with {stats['total_images']} images")
+
+    def on_grouping_error(self, error_message: str):
+        """
+        Handle grouping error.
+
+        Args:
+            error_message: Error message
+        """
+        self.grouping_active = False
+        self.pending_threshold = None
+        self.scanning = False
+        self._close_progress_dialog()
+        self._update_controls()
+
+        self.status_label.setText("Finding duplicates failed. Please try again.")
+        logger.error(f"Grouping error: {error_message}")
+
+        QMessageBox.critical(self, "Error", f"An error occurred while finding duplicates:\n\n{error_message}")
 
     def delete_selected(self):
         """Delete selected images."""
@@ -361,10 +415,8 @@ class MainWindow(QMainWindow):
         if reply != QMessageBox.StandardButton.Yes:
             return
 
-        # Disable controls
-        self.delete_button.setEnabled(False)
-        self.scan_button.setEnabled(False)
-        self.clear_button.setEnabled(False)
+        self.deleting = True
+        self._update_controls()
 
         # Create progress dialog
         self.progress_dialog = ProgressDialog("Deleting Images", self)
@@ -376,10 +428,10 @@ class MainWindow(QMainWindow):
         self.delete_worker.finished.connect(self.on_delete_complete)
         self.delete_worker.error.connect(self.on_delete_error)
 
-        self.delete_worker.start()
-        self.progress_dialog.exec()
-
         logger.info(f"Started deleting {len(selected_paths)} files")
+
+        self.delete_worker.start()
+        self.progress_dialog.show()
 
     def on_delete_complete(self, results: Dict[str, Any]):
         """
@@ -388,9 +440,7 @@ class MainWindow(QMainWindow):
         Args:
             results: Dictionary with deletion results
         """
-        # Close progress dialog
-        if self.progress_dialog:
-            self.progress_dialog.close()
+        self._close_progress_dialog()
 
         success_count = len(results['success'])
         failed_count = len(results['failed'])
@@ -422,40 +472,21 @@ class MainWindow(QMainWindow):
             # Remove deleted images from image_hashes
             self.image_hashes = [img for img in self.image_hashes if img['path'] not in deleted_paths]
 
-            # Filter deleted images from existing groups (fast, no recomputation!)
-            if self.groups:
-                # Remove deleted images from each group
-                filtered_groups = []
-                for group in self.groups:
-                    filtered_group = [img for img in group if img['path'] not in deleted_paths]
-                    # Keep groups that still have duplicates (2+ images)
-                    if len(filtered_group) > 1:
-                        filtered_groups.append(filtered_group)
+            # Update only the affected groups (fast, no recomputation!)
+            self.groups = self.image_viewer.remove_images(deleted_paths)
 
-                self.groups = filtered_groups
-                self.image_viewer.set_groups(self.groups)
-
-                # Update status
-                stats = self.image_viewer.get_stats()
-                if stats['total_groups'] > 0:
-                    self.status_label.setText(
-                        f"Deleted {success_count} images. "
-                        f"Found {stats['total_groups']} groups with {stats['total_images']} duplicates remaining."
-                    )
-                else:
-                    self.status_label.setText(f"Deleted {success_count} images. No duplicates remaining.")
+            # Update status
+            stats = self.image_viewer.get_stats()
+            if stats['total_groups'] > 0:
+                self.status_label.setText(
+                    f"Deleted {success_count} images. "
+                    f"Found {stats['total_groups']} groups with {stats['total_images']} duplicates remaining."
+                )
             else:
-                self.clear_results()
-                self.status_label.setText(f"Deleted {success_count} images. No images remaining.")
+                self.status_label.setText(f"Deleted {success_count} images. No duplicates remaining.")
 
-        # Re-enable controls
-        self.scan_button.setEnabled(True)
-        self.clear_button.setEnabled(True)
-        if self.image_viewer.get_stats()['total_groups'] > 0:
-            self.delete_button.setEnabled(True)
-            self.keep_best_all_button.setEnabled(True)
-        else:
-            self.keep_best_all_button.setEnabled(False)
+        self.deleting = False
+        self._update_controls()
 
         logger.info(f"Deletion complete: {success_count} succeeded, {failed_count} failed")
 
@@ -466,46 +497,71 @@ class MainWindow(QMainWindow):
         Args:
             error_message: Error message
         """
-        # Close progress dialog
-        if self.progress_dialog:
-            self.progress_dialog.close()
+        self._close_progress_dialog()
 
         QMessageBox.critical(self, "Deletion Error", f"An error occurred during deletion:\n\n{error_message}")
 
         self.status_label.setText("Deletion failed.")
-        self.scan_button.setEnabled(True)
-        self.delete_button.setEnabled(True)
-        self.clear_button.setEnabled(True)
+        self.deleting = False
+        self._update_controls()
 
         logger.error(f"Deletion error: {error_message}")
 
     def clear_results(self):
         """Clear all results and reset the view."""
+        self.regroup_timer.stop()
+        self._cancel_grouping()
+
         self.image_hashes = []
         self.groups = []
         self.image_viewer.clear()
         self.status_label.setText("Results cleared. Ready to scan.")
-        self.delete_button.setEnabled(False)
-        self.clear_button.setEnabled(False)
-        self.keep_best_all_button.setEnabled(False)
+        self._update_controls()
 
         logger.info("Results cleared")
 
-    def _update_comparison_progress(self, dialog, current, total, message):
+    def _update_controls(self):
+        """Enable the controls that are valid for the current state."""
+        busy = self.scanning or self.deleting
+        regrouping = self.grouping_active or self.regroup_timer.isActive()
+        can_act_on_groups = bool(self.groups) and not busy and not regrouping
+
+        self.scan_button.setEnabled(not busy)
+        self.threshold_slider.setEnabled(not busy)
+        self.clear_button.setEnabled(bool(self.image_hashes) and not busy)
+        self.delete_button.setEnabled(can_act_on_groups)
+        self.keep_best_all_button.setEnabled(can_act_on_groups)
+
+    def _close_progress_dialog(self):
+        """Close the current progress dialog because its operation ended."""
+        if self.progress_dialog:
+            self.progress_dialog.finish()
+            self.progress_dialog.deleteLater()
+            self.progress_dialog = None
+
+    @staticmethod
+    def _wait_for_worker(worker: Optional[QThread]):
         """
-        Update comparison progress dialog and process events.
+        Wait for a stopping worker: destroying a running QThread aborts the app.
 
         Args:
-            dialog: Progress dialog instance
-            current: Current comparison count
-            total: Total comparisons
-            message: Progress message
+            worker: The worker, if there is one
         """
-        dialog.update_progress(current, total, message)
+        if worker is not None:
+            worker.wait()
 
-        # Process events to keep UI responsive
-        from PyQt6.QtWidgets import QApplication
-        QApplication.processEvents()
+    def closeEvent(self, event):
+        """Stop background work before the window closes."""
+        self.regroup_timer.stop()
+        self._cancel_grouping()
+        if self.scan_worker is not None:
+            self.scan_worker.cancel()
+
+        for worker in (self.scan_worker, self.group_worker, self.delete_worker):
+            self._wait_for_worker(worker)
+        self.image_viewer.shutdown()
+
+        super().closeEvent(event)
 
     def keep_best_in_all_groups(self):
         """Apply 'Keep Best Quality' to groups with 100% similarity only."""
