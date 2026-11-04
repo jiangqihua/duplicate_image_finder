@@ -19,6 +19,9 @@ THUMBNAIL_SIZE = (200, 200)
 THUMBNAIL_CACHE_DIR = '.thumbnail_cache'
 WINDOW_SIZE = (1200, 800)
 MAX_IMAGES_PER_ROW = 4
+GROUP_LOAD_BATCH = 5  # Groups built per step while scrolling
+GROUP_LOAD_AHEAD_SCREENS = 2  # Keep this many screens of groups built below the view
+REGROUP_DELAY_MS = 300  # Wait for the threshold slider to settle before regrouping
 
 # File operations
 USE_TRASH_BY_DEFAULT = True

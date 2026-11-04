@@ -1,61 +1,55 @@
 """Similarity detector module for grouping similar images."""
 
 import logging
+import time
 from typing import List, Dict, Any
+import numpy as np
 from config import DEFAULT_THRESHOLD, HASH_WEIGHTS
 
 logger = logging.getLogger(__name__)
 
+PROGRESS_INTERVAL_SECONDS = 0.05
 
-class UnionFind:
-    """Union-Find (Disjoint Set) data structure for efficient grouping."""
 
-    def __init__(self, n: int):
-        """
-        Initialize Union-Find structure.
+def _pack_hashes(images: List[Dict[str, Any]], name: str) -> np.ndarray:
+    """
+    Pack one hash type of every image into an array of 64-bit words.
 
-        Args:
-            n: Number of elements
-        """
-        self.parent = list(range(n))
-        self.rank = [0] * n
+    Args:
+        images: List of image hash dictionaries
+        name: Hash type ('ahash', 'phash' or 'dhash')
 
-    def find(self, x: int) -> int:
-        """
-        Find root parent of element with path compression.
+    Returns:
+        Array of shape (len(images), words_per_hash) with dtype uint64
+    """
+    bits = np.stack([image[name].hash.ravel() for image in images])
+    packed = np.packbits(bits, axis=1)
+    padding = -packed.shape[1] % 8
+    if padding:
+        packed = np.pad(packed, ((0, 0), (0, padding)))
+    return packed.view(np.uint64)
 
-        Args:
-            x: Element index
 
-        Returns:
-            Root parent index
-        """
-        if self.parent[x] != x:
-            self.parent[x] = self.find(self.parent[x])  # Path compression
-        return self.parent[x]
+def _distances_to_rest(packed: Dict[str, np.ndarray], i: int) -> np.ndarray:
+    """
+    Compute weighted hash distances from image i to every image after it.
 
-    def union(self, x: int, y: int):
-        """
-        Merge two sets containing x and y.
+    Args:
+        packed: Packed hashes per hash type, from _pack_hashes()
+        i: Index of the image to compare
 
-        Args:
-            x: First element index
-            y: Second element index
-        """
-        root_x = self.find(x)
-        root_y = self.find(y)
+    Returns:
+        Array of len(images) - i - 1 weighted distances
+    """
+    def hamming(name: str) -> np.ndarray:
+        words = packed[name]
+        return np.bitwise_count(words[i] ^ words[i + 1:]).sum(axis=1)
 
-        if root_x == root_y:
-            return
-
-        # Union by rank
-        if self.rank[root_x] < self.rank[root_y]:
-            self.parent[root_x] = root_y
-        elif self.rank[root_x] > self.rank[root_y]:
-            self.parent[root_y] = root_x
-        else:
-            self.parent[root_y] = root_x
-            self.rank[root_x] += 1
+    return (
+        HASH_WEIGHTS['ahash'] * hamming('ahash') +
+        HASH_WEIGHTS['phash'] * hamming('phash') +
+        HASH_WEIGHTS['dhash'] * hamming('dhash')
+    )
 
 
 class SimilarityDetector:
@@ -71,18 +65,24 @@ class SimilarityDetector:
         """
         self.threshold = threshold
         self.image_hashes = []
+        self.cancelled = False
+
+    def cancel(self):
+        """Stop an in-progress find_similar_groups() call. Safe from any thread."""
+        self.cancelled = True
 
     def find_similar_groups(self, image_hashes: List[Dict[str, Any]],
                            progress_callback=None) -> List[List[Dict[str, Any]]]:
         """
-        Group similar images using Union-Find clustering.
+        Group similar images by connected components of the "similar" relation.
 
         Args:
             image_hashes: List of image hash dictionaries
             progress_callback: Optional callback(current, total, message) for progress updates
 
         Returns:
-            List of groups, each group is a list of similar image dicts
+            List of groups, each group is a list of similar image dicts.
+            Empty if cancelled.
         """
         if not image_hashes:
             return []
@@ -90,39 +90,41 @@ class SimilarityDetector:
         self.image_hashes = image_hashes
         n = len(image_hashes)
 
-        # Initialize Union-Find structure
-        uf = UnionFind(n)
+        packed = {name: _pack_hashes(image_hashes, name) for name in HASH_WEIGHTS}
 
-        # Calculate total comparisons for progress tracking
+        # labels[i] identifies the cluster image i currently belongs to
+        labels = np.arange(n)
+
         total_comparisons = (n * (n - 1)) // 2
         comparison_count = 0
+        last_report = time.monotonic()
 
-        # Compare all pairs of images
-        for i in range(n):
-            for j in range(i + 1, n):
-                distance = self._compute_distance(image_hashes[i], image_hashes[j])
+        # Compare each image against all the images after it
+        for i in range(n - 1):
+            if self.cancelled:
+                logger.info("Similarity comparison cancelled")
+                return []
 
-                # If distance is below threshold, union the sets
-                if distance <= self.threshold:
-                    uf.union(i, j)
+            distances = _distances_to_rest(packed, i)
+            matches = np.nonzero(distances <= self.threshold)[0] + i + 1
 
-                # Update progress
-                comparison_count += 1
-                if progress_callback and comparison_count % 100 == 0:  # Update every 100 comparisons
-                    progress_callback(comparison_count, total_comparisons,
-                                    f"Comparing images ({comparison_count}/{total_comparisons})")
+            # Merge image i's cluster with the clusters of all its matches
+            if matches.size:
+                labels[np.isin(labels, labels[matches])] = labels[i]
+
+            comparison_count += n - i - 1
+            if progress_callback and time.monotonic() - last_report >= PROGRESS_INTERVAL_SECONDS:
+                last_report = time.monotonic()
+                progress_callback(comparison_count, total_comparisons, "Comparing images")
 
         # Final progress update
         if progress_callback:
-            progress_callback(total_comparisons, total_comparisons, "Grouping similar images...")
+            progress_callback(total_comparisons, total_comparisons, "Grouping similar images")
 
-        # Extract groups from Union-Find
+        # Collect the clusters
         groups_dict = {}
-        for i in range(n):
-            root = uf.find(i)
-            if root not in groups_dict:
-                groups_dict[root] = []
-            groups_dict[root].append(image_hashes[i])
+        for i, label in enumerate(labels.tolist()):
+            groups_dict.setdefault(label, []).append(image_hashes[i])
 
         # Filter out singleton groups (no duplicates)
         groups = [group for group in groups_dict.values() if len(group) > 1]
@@ -179,16 +181,12 @@ class SimilarityDetector:
         if len(group) < 2:
             return 0.0
 
-        total_distance = 0.0
-        count = 0
+        packed = {name: _pack_hashes(group, name) for name in HASH_WEIGHTS}
 
         # Compute average pairwise distance
-        for i in range(len(group)):
-            for j in range(i + 1, len(group)):
-                total_distance += self._compute_distance(group[i], group[j])
-                count += 1
-
-        avg_distance = total_distance / count if count > 0 else 0
+        total_distance = sum(float(_distances_to_rest(packed, i).sum()) for i in range(len(group) - 1))
+        count = len(group) * (len(group) - 1) // 2
+        avg_distance = total_distance / count
 
         # Convert distance to similarity percentage (0-100)
         # Assuming max meaningful distance is 30
@@ -213,17 +211,3 @@ class SimilarityDetector:
         similarity = max(0, min(100, 100 * (1 - distance / 30)))
 
         return similarity
-
-    def update_threshold(self, new_threshold: int, progress_callback=None) -> List[List[Dict[str, Any]]]:
-        """
-        Update threshold and recompute groups.
-
-        Args:
-            new_threshold: New threshold value
-            progress_callback: Optional callback for progress updates
-
-        Returns:
-            Updated list of groups
-        """
-        self.threshold = new_threshold
-        return self.find_similar_groups(self.image_hashes, progress_callback)

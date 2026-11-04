@@ -30,6 +30,7 @@ Core dependencies in `requirements.txt`:
 - Pillow (image processing)
 - pillow-heif (HEIC/HEIF format support)
 - imagehash (perceptual hashing)
+- numpy (fast hash comparison)
 - send2trash (safe file deletion)
 
 ## Project Structure
@@ -43,7 +44,7 @@ duplicate_image_finder/
 ├── core/                            # Processing pipeline
 │   ├── image_scanner.py             # Directory scanning and image validation
 │   ├── hash_calculator.py           # Perceptual hash computation (ahash/phash/dhash)
-│   ├── similarity_detector.py       # Union-Find clustering by hash distance
+│   ├── similarity_detector.py       # NumPy clustering by hash distance
 │   └── file_manager.py              # Safe file deletion via send2trash
 ├── gui/                             # PyQt6 UI
 │   ├── main_window.py               # Main window: orchestration, controls, threading
@@ -53,7 +54,7 @@ duplicate_image_finder/
 │       └── progress_dialog.py       # Modal progress bar with cancel support
 ├── utils/
 │   ├── image_utils.py               # Thumbnail generation with two-level cache (memory + disk)
-│   └── threading_utils.py           # ScanWorker, DeleteWorker, generic WorkerThread
+│   └── threading_utils.py           # ScanWorker, GroupWorker, DeleteWorker, ThumbnailLoader, generic WorkerThread
 ├── .thumbnail_cache/                # Generated at runtime
 └── logs/                            # Generated at runtime (duplicate_finder.log)
 ```
@@ -78,12 +79,12 @@ duplicate_image_finder/
    - HEIC/HEIF support via `pillow_heif.register_heif_opener()`
 
 3. **Similarity Detection** (`core/similarity_detector.py`):
-   - Uses Union-Find (disjoint set) algorithm to group similar images
-   - Compares all image pairs using weighted hash distance (O(n^2) comparisons)
+   - Groups images into connected components of the "similar" relation
+   - Compares all image pairs using weighted hash distance (O(n^2) comparisons, vectorized with NumPy)
    - Groups images if distance <= threshold (default: 5)
    - Filters out singleton groups
    - Sorts groups by similarity percentage (descending), then size
-   - `update_threshold()` re-clusters existing hashes without re-computing them
+   - Runs off the main thread in `GroupWorker`, which has its own detector instance, and can be cancelled
 
 4. **Quality Ranking** (within each group):
    - Images sorted by: resolution -> file size -> modification date (all descending)
@@ -91,17 +92,20 @@ duplicate_image_finder/
 
 ### GUI Architecture
 
-- **Main Window** (`gui/main_window.py`): Folder selection, threshold slider (0-30), scan/delete/clear buttons, status bar. Threshold slider triggers re-clustering without re-hashing.
-- **Image Group Viewer** (`gui/widgets/image_group_viewer.py`): Scrollable groups, each with Select All / Deselect All / Keep Best Quality / Open All buttons. Images laid out in rows of `MAX_IMAGES_PER_ROW` (4).
+- **Main Window** (`gui/main_window.py`): Folder selection, threshold slider (0-30), scan/delete/clear buttons, status bar. Threshold slider triggers background re-clustering without re-hashing, once it has settled (`REGROUP_DELAY_MS`). `_update_controls()` is the single place that enables and disables controls.
+- **Image Group Viewer** (`gui/widgets/image_group_viewer.py`): Scrollable groups, each with Select All / Deselect All / Keep Best Quality / Open All buttons. Images laid out in rows of `MAX_IMAGES_PER_ROW` (4). Group widgets are built only as they near the visible area, so selection is stored in `selected_paths`, not on cards.
 - **Image Card** (`gui/widgets/image_card.py`): 220px-wide card with thumbnail (200x200), filename, file size, dimensions, modification date, and selection checkbox. Emits `selection_changed` signal.
-- **Progress Dialog** (`gui/widgets/progress_dialog.py`): Modal dialog with progress bar, message label, optional cancel button. Deletion progress is non-cancellable.
+- **Progress Dialog** (`gui/widgets/progress_dialog.py`): Modal dialog with progress bar, message label, optional cancel button. Deletion progress is non-cancellable. Shown with `show()`, not `exec()`, so no nested event loops. End an operation with `finish()`: only user cancels emit `rejected`.
 
 ### Background Processing
 
 - `ScanWorker`: Runs scan + hash computation in a QThread. Cancellable (cancels both scanner and hash calculator).
+- `GroupWorker`: Runs similarity grouping in a QThread. Cancellable; emits `finished(None)` when cancelled.
+- `ThumbnailLoader`: Loads thumbnails on a `QThreadPool` as QImages (QPixmap is main-thread only) and delivers them via `loaded(path, image)`.
 - `DeleteWorker`: Runs file deletion in a QThread. Non-cancellable. 10ms sleep between deletions to keep UI responsive.
 - `WorkerThread`: Generic worker for arbitrary callables.
-- All workers emit `progress(int, int, str)`, `finished(object)`, and `error(str)` signals.
+- Keep Python-level work off the main thread: a worker must also be `wait()`ed on before its reference is replaced, because destroying a running QThread aborts the app.
+- All QThread workers emit `progress(int, int, str)`, `finished(object)`, and `error(str)` signals.
 
 ### Thumbnail Caching (`utils/image_utils.py`)
 
@@ -136,8 +140,8 @@ duplicate_image_finder/
 - **Open All** (per group): Opens all images in system viewer (macOS `open`, Windows `start`, Linux `xdg-open`)
 
 ### Incremental Updates
-- Threshold changes re-cluster without re-hashing (via `SimilarityDetector.update_threshold()`)
-- After deletion, groups are filtered in-place without re-clustering
+- Threshold changes re-cluster without re-hashing (via `GroupWorker`)
+- After deletion, `ImageGroupViewer.remove_images()` rebuilds only the affected groups, without re-clustering
 
 ### File Operations
 - Deletion uses `send2trash` library (safe, recoverable from system trash)
@@ -150,12 +154,12 @@ duplicate_image_finder/
 1. Import algorithm in `core/hash_calculator.py`
 2. Add to `compute_hash()` method result dictionary
 3. Update `HASH_ALGORITHMS` and `HASH_WEIGHTS` in `config.py`
-4. Update weight calculation in `similarity_detector.py:_compute_distance()`
+4. Update weight calculation in `similarity_detector.py`: `_compute_distance()` and `_distances_to_rest()`
 
 ### Modifying Similarity Logic
-- Edit `SimilarityDetector._compute_distance()` for custom distance calculation
+- Edit `SimilarityDetector._compute_distance()` and `_distances_to_rest()` for custom distance calculation
 - Edit `SimilarityDetector.find_similar_groups()` for different clustering algorithms
-- Current implementation uses Union-Find; could be replaced with hierarchical clustering
+- Current implementation merges connected components; could be replaced with hierarchical clustering
 
 ### Adding UI Features
 - Background operations must use QThread to avoid blocking UI
